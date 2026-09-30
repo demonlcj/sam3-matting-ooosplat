@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+
+# Local results and test media
+test/
+*_sam3_output*/
+sam3_ooosplat_error.log
+ooosplat_export_error.log
+
+# Keep the vendored Matting Anything source, but not its original Git metadata
+# or large local model weights.
+Matting-Anything/.git-upstream/
+Matting-Anything/checkpoints/
