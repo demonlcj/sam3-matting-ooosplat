@@ -46,6 +46,34 @@ python app.py
 
 透明视频编码需要系统可找到 `ffmpeg.exe`；如果没有安装 FFmpeg，程序仍会完整输出 `rgba_frames` 透明 PNG 序列，不会影响后续 Matting Anything。
 
+## 视频输入要求
+
+SAM3 的视频加载器（`sam3/model/utils/sam2_utils.py`）只接受两种输入：
+
+- **H.264 编码的 MP4**，或
+- **JPEG 图片序列目录**
+
+其它编码会在加载阶段报 `Only MP4 video and JPEG folder are supported at this moment`，但这个提示不会说明真正原因是编码不对。程序现在会在加载模型之前用 `ffprobe` 检查编码，并给出可直接复制的转码命令：
+
+```bash
+ffmpeg -i input.mp4 -c:v libx264 -pix_fmt yuv420p -crf 20 -preset veryfast out.mp4
+```
+
+需要留意 OpenCV 的 `VideoWriter` 默认写 `mp4v`，用它导出的文件无法直接使用。
+
+另一个坑：`init_state(video_path=...)` 内部用 `isinstance(video_path, str)` 判断后再检查扩展名，因此传 `Path` 对象会被判定为「既不是 MP4 也不是图片目录」。程序已在调用前统一转为 `str`。
+
+## Windows / Triton 说明
+
+SAM3 依赖 Triton，而 Triton 官方只发布 Linux 和 macOS 的 wheel，没有 Windows 版本。这会在两个地方影响 Windows 用户，`windows_compat.py` 分别处理：
+
+1. **导入阶段**：`sam3/model/edt.py` 在模块顶层 `import triton`，因此 `import sam3` 会直接抛 `ModuleNotFoundError`。`install_triton_import_stub()` 注册一个占位模块，让 SAM3 的导入链能走通。
+2. **调用阶段**：占位模块本身不可用。SAM3 的跟踪器会无条件调用 `edt_triton`，掩码后处理也会走 `sam3.perflib.connected_components`，`install_sam3_cpu_fallbacks()` 把这两处替换为等价的 OpenCV CPU 实现。
+
+EDT 的 CPU 实现是等价替换而非近似：SAM3 的内核先把非零像素置为 `1e18`，做两遍平方欧氏距离变换，最后开方 —— 这正好等于在 0/1 图像上调用 `cv2.distanceTransform(..., DIST_L2, DIST_MASK_PRECISE)`，上游 docstring 本身也是这么描述的。
+
+如果本机确实装了 Triton，两个函数都会自动跳过，不会覆盖真实实现。
+
 界面中的“输出位置”可以选择结果保存的父目录。程序会在该目录下创建一个独立任务文件夹，默认名称为 `<视频名>_sam3_output`；如果同名文件夹已存在，会自动创建 `_2`、`_3` 等新文件夹，不会覆盖之前的结果：
 
 ```text

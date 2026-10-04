@@ -86,47 +86,44 @@ def frame_to_qimage(frame: np.ndarray, mode: str, mask: np.ndarray | None) -> QI
     return cv_to_qimage(frame)
 
 
-def _install_windows_sam3_fallbacks():
-    """Replace SAM3's CUDA-only Triton connected components on Windows.
+def _warn_if_not_h264(video_path):
+    """SAM3's video loader only decodes H.264 MP4; anything else fails later
+    with "Only MP4 video and JPEG folder are supported", which does not tell the
+    user their codec is the problem. OpenCV's default writer produces mp4v, so
+    this is a common trap. Warns early instead of failing after model load.
+    """
+    probe = shutil.which("ffprobe")
+    if not probe: return
+    try:
+        result = subprocess.run(
+            [probe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "stream=codec_name", "-of", "default=nw=1:nk=1", str(video_path)],
+            capture_output=True, text=True, timeout=15,
+        )
+        codec = result.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return
+    if codec and codec.lower() not in ("h264", "avc1"):
+        raise RuntimeError(
+            f"SAM3 只支持 H.264 编码的 MP4，当前文件是 {codec}。\n"
+            "请先转码：\n"
+            f'  ffmpeg -i "{video_path}" -c:v libx264 -pix_fmt yuv420p '
+            "-crf 20 -preset veryfast out.mp4"
+        )
 
-    The operation is post-processing for mask hole filling, so an OpenCV CPU
-    implementation is a compatible fallback when Triton is unavailable.
+
+def _install_windows_sam3_fallbacks():
+    """Replace SAM3's Triton-only kernels with OpenCV CPU implementations.
+
+    Triton publishes no Windows wheels, so SAM3 cannot even be imported without
+    help. ``windows_compat`` handles both the import-time stub and the
+    call-time replacements; see that module for the full rationale.
     """
     try:
-        import torch
-        import sam3.perflib.connected_components as components
+        from windows_compat import install_sam3_cpu_fallbacks
     except ImportError:
         return
-
-    def connected_components_fallback(input_tensor):
-        original_shape = tuple(input_tensor.shape)
-        if input_tensor.dim() == 3:
-            input_tensor = input_tensor.unsqueeze(1)
-        if input_tensor.dim() != 4 or input_tensor.shape[1] != 1:
-            raise ValueError("Input tensor must be (B, H, W) or (B, 1, H, W).")
-        binary = input_tensor.detach().to("cpu").numpy()[:, 0] != 0
-        labels_batch = []
-        counts_batch = []
-        for image in binary:
-            count, labels, stats, _ = cv2.connectedComponentsWithStats(
-                image.astype(np.uint8), connectivity=8
-            )
-            labels = labels.astype(np.int64, copy=False)
-            counts = np.zeros_like(labels, dtype=np.int64)
-            if count > 0:
-                areas = stats[:, cv2.CC_STAT_AREA].astype(np.int64, copy=False)
-                areas[0] = 0
-                counts = areas[labels]
-            labels_batch.append(labels)
-            counts_batch.append(counts)
-        device = input_tensor.device
-        labels_tensor = torch.from_numpy(np.stack(labels_batch, axis=0)).to(device)
-        counts_tensor = torch.from_numpy(np.stack(counts_batch, axis=0)).to(device)
-        if len(original_shape) == 3:
-            return labels_tensor, counts_tensor
-        return labels_tensor.unsqueeze(1), counts_tensor.unsqueeze(1)
-
-    components.connected_components = connected_components_fallback
+    install_sam3_cpu_fallbacks()
 
 
 class PreviewCanvas(QFrame):
@@ -274,6 +271,14 @@ class TrackWorker(QObject):
         if not SAM3_ROOT.exists(): raise FileNotFoundError(f"SAM3_ROOT 不存在: {SAM3_ROOT}")
         if not SAM3_CHECKPOINT.exists(): raise FileNotFoundError(f"SAM3 checkpoint 不存在: {SAM3_CHECKPOINT}")
         sys.path.insert(0, str(SAM3_ROOT))
+        # SAM3 imports triton at module scope and triton has no Windows wheels,
+        # so the stub must be registered before the first sam3 import.
+        try:
+            from windows_compat import install_triton_import_stub
+        except ImportError:
+            pass
+        else:
+            install_triton_import_stub()
         try:
             from sam3.model_builder import build_sam3_video_model
         except ImportError as exc:
@@ -284,9 +289,14 @@ class TrackWorker(QObject):
         _install_windows_sam3_fallbacks()
         self.output_dir.mkdir(parents=True, exist_ok=True); dirs = [self.output_dir / name for name in ("mask_frames", "rgba_frames", "overlay_frames")]
         for path in dirs: path.mkdir(exist_ok=True)
+        # SAM3's load_video_frames does ``isinstance(video_path, str)`` and then
+        # checks the extension, so a Path silently fails the .mp4 test and raises
+        # a misleading NotImplementedError. Normalise before handing it over.
+        if not isinstance(self.video_path, str): self.video_path = str(self.video_path)
         cap = cv2.VideoCapture(self.video_path)
         if not cap.isOpened(): raise RuntimeError(f"无法打开视频: {self.video_path}")
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)); fps = cap.get(cv2.CAP_PROP_FPS) or 24.0; width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)); cap.release()
+        if Path(self.video_path).suffix.lower() == ".mp4": _warn_if_not_h264(self.video_path)
         self.progress.emit(1, "加载 SAM3 模型…")
         # Use SAM3's official SAM2-compatible interactive tracker API. The
         # higher-level video predictor is for text/detection prompts and does
